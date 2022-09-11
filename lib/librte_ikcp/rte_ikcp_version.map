@@ -1,0 +1,11 @@
+DPDK_20.0 {
+	global:
+
+	rte_ikcp_create;
+	rte_ikcp_update;
+	rte_ikcp_send;
+	rte_ikcp_recv;
+	rte_ikcp_input;
+
+	local: *;
+};
