@@ -6,6 +6,13 @@
 #define RTE_LOGTYPE_IKCP_PRIVATE RTE_LOGTYPE_USER1
 
 #define IKCP_INPUT_BUF_MAX_SIZE (1 << 16)
+#define IKCP_INPUT_BURST_SIZE 32U
+
+#define IKCP_MQ_NAME_SZIE 64
+#define IKCP_TX_QUEUE_NAME_FMT "IKCP_TX_%u"
+#define IKCP_RX_QUEUE_NAME_FMT "IKCP_RX_%u"
+#define IKCP_TX_QUEUE_SIZE 4096
+#define IKCP_RX_QUEUE_SIZE 4096
 
 #ifndef DIV_ROUND_UP
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
@@ -41,6 +48,7 @@ static inline int32_t ikcp_output(const char *buf, int32_t len, ikcpcb *kcp, voi
 	uint16_t is_ipv4;
 	uint16_t hdr_len;
 	uint16_t copy_len;
+	int32_t nb_tx;
 
 	ikcp = container_of(kcp, struct rte_ikcp, kcp);
 	port_id = ikcp->config.port_id;
@@ -138,7 +146,15 @@ static inline int32_t ikcp_output(const char *buf, int32_t len, ikcpcb *kcp, voi
 
 	RTE_SET_USED(user);
 
-	return (int32_t)rte_eth_tx_burst(port_id, txq_id, &head, 1);
+	if (ikcp->config.flags & RTE_IKCP_MQ) {
+		nb_tx = (int32_t)rte_ring_sp_enqueue(ikcp->tx_queue, head) == 0 ? 1 : 0;
+	}
+	else {
+		nb_tx = (int32_t)rte_eth_tx_burst(port_id, txq_id, &head, 1);
+		rte_pktmbuf_free(head);
+	}
+
+	return nb_tx;
 }
 
 static inline struct rte_ikcp * find_next_valid_ikcp(uint16_t port_id, uint32_t conv)
@@ -159,6 +175,7 @@ struct rte_ikcp * rte_ikcp_create(struct rte_ikcp_config config, uint32_t conv, 
 {
 	struct rte_eth_dev *dev;
 	struct rte_ikcp *ikcp;
+	char queue_name[IKCP_MQ_NAME_SZIE];
 	uint16_t port_id;
 	uint16_t txq_id;
 
@@ -196,22 +213,35 @@ struct rte_ikcp * rte_ikcp_create(struct rte_ikcp_config config, uint32_t conv, 
 		return NULL;
 	}
 
+	ikcp->config = config;
 	if (ikcp->config.flags & RTE_IKCP_ENABLE_PRIVATE_LOG) {
 		ikcp->kcp.logmask = ~0;
 		ikcp->kcp.writelog = rte_ikcp_log;
-		RTE_LOG(ERR, IKCP, "enable log\n");
 	}
 
-	ikcp->config = config;
-	ikcp->config.flags |= RTE_IKCP_USED;
-	if (ikcp->config.flags & RTE_IKCP_ENABLE_PRIVATE_LOG) {
-		ikcp->kcp.logmask = ~0;
-		ikcp->kcp.writelog = rte_ikcp_log;
+	if (ikcp->config.flags & RTE_IKCP_MQ) {
+		snprintf(queue_name, IKCP_MQ_NAME_SZIE, IKCP_RX_QUEUE_NAME_FMT, conv);
+		ikcp->rx_queue = rte_ring_create(queue_name, IKCP_RX_QUEUE_SIZE, SOCKET_ID_ANY, RING_F_SC_DEQ);
+		if (!ikcp->rx_queue) {
+			RTE_LOG(ERR, IKCP, "Create rx queue for conv: %u failed\n", conv);
+			return NULL;
+		}
+
+		snprintf(queue_name, IKCP_MQ_NAME_SZIE, IKCP_TX_QUEUE_NAME_FMT, conv);
+		ikcp->tx_queue = rte_ring_create(queue_name, IKCP_TX_QUEUE_SIZE, SOCKET_ID_ANY, RING_F_SP_ENQ);
+		if (!ikcp->tx_queue) {
+			RTE_LOG(ERR, IKCP, "Create tx queue for conv: %u failed\n", conv);
+			return NULL;
+		}
 	}
 
 	ikcp_setoutput(&ikcp->kcp, ikcp_output);
+	ikcp_nodelay(&ikcp->kcp, 1, 10, 2, 1);
 
 	/* TODO: Set mss smaller than MTU. */
+	/* TODO: Register device destory callback. */
+
+	ikcp->config.flags |= RTE_IKCP_USED;
 
 	return ikcp;
 }
@@ -285,5 +315,35 @@ int32_t rte_ikcp_input(struct rte_ikcp *ikcp, struct rte_mbuf *mbuf)
 
 	RTE_LOG(DEBUG, IKCP, "ikcp input: %s(%u).\n", data, len);
 
-	return ikcp_input(&ikcp->kcp, data, len);
+	ikcp_input(&ikcp->kcp, data, len);
+
+	rte_pktmbuf_free(mbuf);
+
+	return 0;
+}
+
+int32_t rte_ikcp_input_bulk(struct rte_ikcp *ikcp) {
+	int nb_rx, i, count;
+	struct rte_mbuf *mbufs[IKCP_INPUT_BURST_SIZE];
+
+	if (!(ikcp->config.flags & RTE_IKCP_MQ)) {
+		RTE_LOG(DEBUG, IKCP, "Multi queue is not enabled.\n");
+		return -1;
+	}
+
+	count = RTE_MIN(rte_ring_count(ikcp->rx_queue), IKCP_INPUT_BURST_SIZE);
+	if (!count) {
+		return 0;
+	}
+
+	nb_rx = rte_ring_sc_dequeue_bulk(ikcp->rx_queue, (void **)mbufs, count, NULL);
+	if (!nb_rx) {
+		return 0;
+	}
+
+	for (i = 0; i < nb_rx; ++i) {
+		rte_ikcp_input(ikcp, mbufs[i]);
+	}
+
+	return 0;
 }

@@ -14,6 +14,7 @@
 #define RTE_IKCP_L3_TYPE_IPV4       (1 << 1)
 #define RTE_IKCP_L3_TYPE_IPV6       (1 << 2)
 #define RTE_IKCP_ENABLE_PRIVATE_LOG (1 << 3)
+#define RTE_IKCP_MQ                 (1 << 4)
 
 #define RTE_IKCP_L3_TYPE_MASK (RTE_IKCP_L3_TYPE_IPV4 | RTE_IKCP_L3_TYPE_IPV6)
 
@@ -38,6 +39,7 @@ struct rte_ikcp_config {
 struct rte_ikcp {
 	ikcpcb kcp;
 	struct rte_ikcp_config config;
+	struct rte_ring *rx_queue, *tx_queue;
 };
 
 struct rte_ikcp *rte_ikcp_create(struct rte_ikcp_config config, uint32_t conv, void *user);
@@ -45,6 +47,7 @@ int32_t rte_ikcp_update(struct rte_ikcp *ikcp);
 int32_t rte_ikcp_send(struct rte_ikcp *kcp, const char* data, int32_t len);
 int32_t rte_ikcp_recv(struct rte_ikcp *kcp, char* data, int32_t len);
 int32_t rte_ikcp_input(struct rte_ikcp *kcp, struct rte_mbuf *mbuf);
+int32_t rte_ikcp_input_bulk(struct rte_ikcp *ikcp);
 
 #ifdef __cplusplus
 }
