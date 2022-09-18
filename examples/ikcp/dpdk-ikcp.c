@@ -20,7 +20,7 @@
 #define MEMPOOL_CACHE_SIZE 256
 #define BURST_SIZE 32
 #define SEND_NUM 1
-#define PAYLOAD_LEN 128
+#define PAYLOAD_LEN (1 << 16)
 #define UDP_SRC_PORT 6655
 #define UDP_DST_PORT 6655
 #define DEV_NAME_LEN 128
@@ -56,12 +56,11 @@ static int g_dpdk_kcp_mq = 0;
 static uint16_t g_dpdk_kcp_lcore = RTE_MAX_LCORE;
 
 int parse_args(int argc, char **argv, int is_pmd);
-int dpdk_slave_loop(__rte_unused void *arg);
-int master_loop(void);
-int send_mbuf(struct rte_mbuf **mbufs, uint64_t pkt_idx);
-int socket_ikcp_output(const char *buf, int len, __rte_unused ikcpcb *kcp, __rte_unused void *user);
-void *socket_slave_loop(__rte_unused void *arg);
-uint32_t get_timestamp(void);
+static inline int dpdk_slave_loop(__rte_unused void *arg);
+static inline int master_loop(void);
+static inline int socket_ikcp_output(const char *buf, int len, __rte_unused ikcpcb *kcp, __rte_unused void *user);
+static inline void *socket_slave_loop(__rte_unused void *arg);
+static inline uint32_t get_timestamp(void);
 
 int parse_args(int argc, char **argv, int is_pmd)
 {
@@ -243,7 +242,7 @@ int dpdk_slave_loop(__rte_unused void *arg)
 	ikcp_interval = rte_get_tsc_hz() / 100;
 
 	/* Around 500ms. */
-	send_interval = rte_get_tsc_hz() / 2 / 50;
+	send_interval = rte_get_tsc_hz() / 2;
 
 	RTE_LOG(INFO, APP, "tsc hz: %"PRIu64" ikcp_interval: %"PRIu64" send_interval: %"PRIu64"\n",
 			rte_get_tsc_hz(), ikcp_interval, send_interval);
@@ -253,7 +252,7 @@ int dpdk_slave_loop(__rte_unused void *arg)
 			tsc = rte_rdtsc();
 			/* Update ikcp. */
 			if (tsc - ikcp_tsc > ikcp_interval) {
-				ikcp_interval = tsc;
+				ikcp_tsc = tsc;
 				rte_ikcp_update(ikcp);
 			}
 
@@ -340,79 +339,7 @@ int master_loop(void)
 	return 0;
 }
 
-int send_mbuf(struct rte_mbuf **mbufs, uint64_t pkt_idx)
-{
-	struct rte_mbuf *mbuf;
-	struct rte_ether_hdr *ether_hdr;
-	struct rte_ipv4_hdr *ipv4_hdr;
-	struct rte_udp_hdr *udp_hdr;
-	char *payload;
-	int pkt_len;
-	uint16_t nb_tx;
-
-	pkt_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + PAYLOAD_LEN;
-	mbuf = rte_pktmbuf_alloc(g_pktmbuf_pool);
-	if (!mbuf) {
-		RTE_LOG(ERR, APP, "Alloc mbuf failed\n");
-		return -1;
-	}
-
-	nb_tx = 1;
-
-	mbuf->data_len = pkt_len;
-	mbuf->next = NULL;
-
-	/* Fill L2 info. */
-	ether_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
-	rte_ether_addr_copy(&g_dst_mac, &ether_hdr->d_addr);
-	rte_eth_macaddr_get(g_portid, &ether_hdr->s_addr);
-	ether_hdr->ether_type = htons(RTE_ETHER_TYPE_IPV4);
-
-	/* Fill L3 info. */
-	ipv4_hdr = (struct rte_ipv4_hdr *)(ether_hdr + 1);
-	memset(ipv4_hdr, 0, sizeof(struct rte_ipv4_hdr));
-	ipv4_hdr->version_ihl = RTE_IPV4_VHL_DEF;
-	ipv4_hdr->type_of_service = 0;
-	ipv4_hdr->fragment_offset = 0;
-	ipv4_hdr->time_to_live = 64;
-	ipv4_hdr->next_proto_id	= IPPROTO_UDP;
-	ipv4_hdr->packet_id = 0;
-	ipv4_hdr->src_addr = htonl(g_src_ip);
-	ipv4_hdr->dst_addr = htonl(g_dst_ip);
-	ipv4_hdr->total_length = htons(pkt_len - sizeof(struct rte_ether_hdr));
-	ipv4_hdr->hdr_checksum = 0;
-
-	/* Fill L4 info. */
-	udp_hdr = (struct rte_udp_hdr *)(ipv4_hdr + 1);
-	udp_hdr->src_port = htons(UDP_SRC_PORT);
-	udp_hdr->dst_port = htons(UDP_DST_PORT);
-	udp_hdr->dgram_cksum = 0;
-	udp_hdr->dgram_len = htons(pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr));
-
-	/* Fill payload. */
-	payload = (char *)(udp_hdr + 1);
-	memset(payload, 0, PAYLOAD_LEN);
-	snprintf(payload, PAYLOAD_LEN, "Pkt No.%" PRIu64, pkt_idx);
-
-	/* Do checksum. */
-	udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ipv4_hdr, udp_hdr);
-	ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
-
-	/* Fill mbuf info. */
-	mbuf->nb_segs = 1;
-	mbuf->pkt_len = pkt_len;
-	mbuf->ol_flags = 0;
-	mbuf->vlan_tci = 0;
-	mbuf->vlan_tci_outer = 0;
-	mbuf->l2_len = sizeof(struct rte_ether_hdr);
-	mbuf->l3_len = sizeof(struct rte_ipv4_hdr);
-
-	mbufs[0] = mbuf;
-
-	return nb_tx;
-}
-
-uint32_t get_timestamp(void)
+static inline uint32_t get_timestamp(void)
 {
 	struct timeval time;
 
@@ -442,7 +369,7 @@ void *socket_slave_loop(__rte_unused void *arg)
 
 	while (g_loop) {
 		ts = get_timestamp();
-		if (ts - last_ts > 20) {
+		if (ts - last_ts > 10) {
 			ikcp_update(ikcp, ts);
 			last_ts = ts;
 		}
