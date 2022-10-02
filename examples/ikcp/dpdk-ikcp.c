@@ -33,6 +33,7 @@
 #define STOP_STATUS 0
 #define LOOP_RUNNING 1
 #define LOOP_STOP 0
+#define DISPLAY_INTERVAL 1000
 
 static const struct rte_eth_conf port_conf_default = {
 	.rxmode = {
@@ -50,10 +51,23 @@ static uint16_t g_portid;
 static uint32_t g_src_ip, g_dst_ip;
 static int g_send_status;
 static int g_loop;
+static int g_is_pmd;
 static int g_is_ipv4 = 1;
-static int g_dpdk_kcp_debug;
+static int g_display_verbose = 0;
+static int g_dpdk_kcp_debug = 0;
 static int g_dpdk_kcp_mq = 0;
 static uint16_t g_dpdk_kcp_lcore = RTE_MAX_LCORE;
+
+#define DP_LOG(...) do { \
+	if (g_display_verbose) { \
+		if (g_is_pmd) { \
+			RTE_LOG(DEBUG, APP, __VA_ARGS__); \
+		} \
+		else { \
+			printf(__VA_ARGS__); \
+		} \
+	} \
+} while (0)
 
 int parse_args(int argc, char **argv, int is_pmd);
 static inline int dpdk_slave_loop(__rte_unused void *arg);
@@ -82,16 +96,17 @@ int parse_args(int argc, char **argv, int is_pmd)
 	};
 
 	if (is_pmd) {
-		while ((opt = getopt_long(argc, argv, "46h",
+		while ((opt = getopt_long(argc, argv, "46vh",
 				dpdk_long_option, &option_index)) != EOF) {
 			switch(opt) {
 			case '4':
 				g_is_ipv4 = 1;
-				printf("ipv4\n");
 				break;
 			case '6':
 				g_is_ipv4 = 0;
-				printf("ipv6\n");
+				break;
+			case 'v':
+				g_display_verbose = 1;
 				break;
 			case 0:
 				if (!strncmp(dpdk_long_option[option_index].name, "device", MAX_LONG_OPT_SZ)) {
@@ -132,6 +147,7 @@ int parse_args(int argc, char **argv, int is_pmd)
 				" --dst DST --next-hop-mac M:M:M:M:M:M\n"
 				"		-4: Use IPv4 (default)\n"
 				"		-6: Use IPv6\n"
+				"		-v: Display verbose send/recv details\n"
 				"		--device: Assign the PCI address of device\n"
 				"		--src: Assign the source IP\n"
 				"		--dst: Assign the destination IP\n"
@@ -160,7 +176,7 @@ int parse_args(int argc, char **argv, int is_pmd)
 		}
 	}
 	else {
-		while ((opt = getopt_long(argc, argv, "46h",
+		while ((opt = getopt_long(argc, argv, "46vh",
 				socket_long_option, &option_index)) != EOF) {
 			switch(opt) {
 			case '4':
@@ -168,6 +184,9 @@ int parse_args(int argc, char **argv, int is_pmd)
 				break;
 			case '6':
 				g_is_ipv4 = 0;
+				break;
+			case 'v':
+				g_display_verbose = 1;
 				break;
 			case 0:
 				if (!strncmp(socket_long_option[option_index].name, "src", MAX_LONG_OPT_SZ)) {
@@ -192,6 +211,8 @@ int parse_args(int argc, char **argv, int is_pmd)
 				printf("%s [-4|-6] --dst DST\n"
 				"		-4: IP address is IPv4 (default)\n"
 				"		-6: IP address is IPv6\n"
+				"		-v: Display verbose send/recv details\n"
+				"		--src: Assign the source IP\n"
 				"		--dst: Assign the destination IP\n",
 				       argv[0]);
 				return -1;
@@ -212,7 +233,8 @@ int dpdk_slave_loop(__rte_unused void *arg)
 	struct rte_mbuf *mbufs[BURST_SIZE];
 	struct rte_eth_dev *dev;
 	uint16_t work_id, txq_idx, rxq_idx, nb_rx;
-	uint64_t pkt_idx, ikcp_interval, send_interval, ikcp_tsc = 0, send_tsc = 0, tsc;
+	uint64_t pkt_idx, ikcp_interval, send_interval, display_interval;
+	uint64_t ikcp_tsc = 0, send_tsc = 0, tsc, recv_count = 0, display_tsc = 0;
 	char buf[PAYLOAD_LEN] = {0}, out_buf[PAYLOAD_LEN] = {0};
 	int32_t recv_len;
 	int i, enable_send = 0, enable_recv = 0;
@@ -244,8 +266,12 @@ int dpdk_slave_loop(__rte_unused void *arg)
 	/* Around 500ms. */
 	send_interval = rte_get_tsc_hz() / 2;
 
-	RTE_LOG(INFO, APP, "tsc hz: %"PRIu64" ikcp_interval: %"PRIu64" send_interval: %"PRIu64"\n",
-			rte_get_tsc_hz(), ikcp_interval, send_interval);
+	/* Around 1000ms. */
+	display_interval = rte_get_tsc_hz();
+
+	RTE_LOG(INFO, APP, "tsc hz: %"PRIu64" ikcp_interval: %"PRIu64""
+			"send_interval: %"PRIu64" display_interval: %"PRIu64"\n",
+			rte_get_tsc_hz(), ikcp_interval, send_interval, display_interval);
 
 	while (g_loop) {
 		if (g_dpdk_kcp_lcore == rte_lcore_id()) {
@@ -260,13 +286,15 @@ int dpdk_slave_loop(__rte_unused void *arg)
 			recv_len = rte_ikcp_recv(ikcp, buf, PAYLOAD_LEN);
 			if (recv_len > 0) {
 				strncpy(out_buf, buf, recv_len);
-				RTE_LOG(INFO, APP, "ikcp recv: %s.\n", out_buf);
+				DP_LOG("ikcp recv: %s.\n", out_buf);
+				++recv_count;
 			}
 
 			/* ikcp send. */
 			if (tsc - send_tsc > send_interval && g_send_status == SEND_STATUS) {
 				send_tsc = tsc;
 				snprintf(buf, PAYLOAD_LEN, "[%u] Pkt No.%" PRIu64, rte_lcore_id(), pkt_idx++);
+				DP_LOG("Send: %s.\n", buf);
 				if (rte_ikcp_send(ikcp, buf, strlen(buf)) < 0) {
 					RTE_LOG(ERR, APP, "ikcp send failed.\n");
 				}
@@ -276,6 +304,13 @@ int dpdk_slave_loop(__rte_unused void *arg)
 				if (unlikely(rte_ikcp_input_bulk(ikcp) < 0)) {
 					RTE_LOG(DEBUG, APP, "ikcp input failed.\n");
 				}
+			}
+
+			if (tsc - display_tsc > display_interval) {
+				RTE_LOG(INFO, APP, "timestamp: %"PRIu64" recv %"PRIu64" pkts in last %"PRIu64" cycles.\n",
+						tsc, recv_count, display_interval);
+				recv_count = 0;
+				display_tsc = tsc;
 			}
 		}
 
@@ -350,6 +385,7 @@ static inline uint32_t get_timestamp(void)
 
 int socket_ikcp_output(const char *buf, int len, __rte_unused ikcpcb *kcp, __rte_unused void *user)
 {
+	DP_LOG("ikcp_output at: %u\n", get_timestamp());
 	if (sendto(g_sock, buf, len, 0, (struct sockaddr *)&g_dst, sizeof(g_dst)) <= 0) {
 		perror("sendto failed");
 		return -1;
@@ -360,9 +396,8 @@ int socket_ikcp_output(const char *buf, int len, __rte_unused ikcpcb *kcp, __rte
 
 void *socket_slave_loop(__rte_unused void *arg)
 {
-	static char suffix[] = " ACK";
 	char buf[PAYLOAD_LEN + 1];
-	uint64_t ts, last_ts = 0;
+	uint64_t ts, last_ts = 0, pkt_idx = 0, send_ts = 0, display_ts = 0, recv_count = 0;
 	socklen_t len;
 	ssize_t recv_len;
 	ikcpcb *ikcp = (ikcpcb *)g_ikcp;
@@ -374,6 +409,22 @@ void *socket_slave_loop(__rte_unused void *arg)
 			last_ts = ts;
 		}
 
+		if (ts - send_ts > 500 && g_send_status == SEND_STATUS) {
+			send_ts = ts;
+			snprintf(buf, PAYLOAD_LEN, "Pkt No.%lu", pkt_idx++);
+			DP_LOG("Send: %s.\n", buf);
+			if (ikcp_send(ikcp, buf, strlen(buf)) < 0) {
+				perror("ikcp send failed");
+			}
+		}
+
+		if (ts - display_ts > DISPLAY_INTERVAL) {
+			printf("timestamp: %"PRIu64" recv %"PRIu64" pkts in last %d milliseconds.\n",
+				   ts, recv_count, DISPLAY_INTERVAL);
+			display_ts = ts;
+			recv_count = 0;
+		}
+
 		recv_len = recvfrom(g_sock, buf, PAYLOAD_LEN, 0, (struct sockaddr *)&g_dst, &len);
 		if (recv_len <= 0) {
 			if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -382,7 +433,7 @@ void *socket_slave_loop(__rte_unused void *arg)
 			continue;
 		}
 
-		// printf("udp recv: %s(%zu) dst: %d\n", buf, recv_len, g_dst.sin_addr.s_addr);
+		// DP_LOG("udp recv: %s(%zu) dst: %d\n", buf, recv_len, g_dst.sin_addr.s_addr);
 
 		ikcp_input(ikcp, buf, recv_len);
 
@@ -392,13 +443,8 @@ void *socket_slave_loop(__rte_unused void *arg)
 		}
 
 		buf[recv_len] = 0;
-		printf("ikcp recv: %s.\n", buf);
-		strcpy(buf + recv_len, suffix);
-
-		if (ikcp_send(ikcp, buf, recv_len + strlen(suffix)) < 0) {
-			perror("ikcp send failed");
-			continue;
-		}
+		++recv_count;
+		DP_LOG("ikcp recv: %s.\n", buf);
 	}
 
 	return NULL;
@@ -406,15 +452,15 @@ void *socket_slave_loop(__rte_unused void *arg)
 
 int main(int argc, char **argv)
 {
-	int ret = 0, is_pmd;
+	int ret = 0;
 	char prog[64];
 
 	if (argc > 1 && !strcmp(argv[1], "--socket-kcp")) {
-		is_pmd = 0;
+		g_is_pmd = 0;
 		snprintf(prog, 64, "%s --socket-kcp", argv[0]);
 	}
 	else if (argc > 1 && !strcmp(argv[1], "--dpdk-kcp")) {
-		is_pmd = 1;
+		g_is_pmd = 1;
 		snprintf(prog, 64, "%s --dpdk-kcp", argv[0]);
 	}
 	else {
@@ -430,7 +476,7 @@ int main(int argc, char **argv)
 	argv[0] = prog;
 
 	/* pmd mode. */
-	if (is_pmd) {
+	if (g_is_pmd) {
 		int i, nb_rx_q, nb_tx_q;
 		uint16_t lcoreid;
 		struct rte_eth_dev *dev;
@@ -445,7 +491,7 @@ int main(int argc, char **argv)
 		argc -= ret;
 		argv += ret;
 
-		if (parse_args(argc, argv, is_pmd)) {
+		if (parse_args(argc, argv, g_is_pmd)) {
 			rte_eal_cleanup();
 			exit(-1);
 		}
@@ -525,6 +571,7 @@ int main(int argc, char **argv)
 			rte_exit(EXIT_FAILURE, "Can't get work lcore.\n");
 		}
 
+		memset(&ikcp_config, 0, sizeof(ikcp_config));
 		ikcp_config.port_id = g_portid;
 		ikcp_config.txq_id = 0;
 		ikcp_config.src_ip.ipv4 = g_src_ip;
@@ -549,7 +596,7 @@ int main(int argc, char **argv)
 		}
 
 		g_loop = LOOP_RUNNING;
-		g_send_status = SEND_STATUS;
+		g_send_status = STOP_STATUS;
 
 		rte_eal_mp_remote_launch(dpdk_slave_loop, NULL, SKIP_MASTER);
 
@@ -571,7 +618,7 @@ int main(int argc, char **argv)
 	else {
 		pthread_t tid;
 
-		if (parse_args(argc, argv, is_pmd)) {
+		if (parse_args(argc, argv, g_is_pmd)) {
 			exit(-1);
 		}
 
@@ -602,7 +649,7 @@ int main(int argc, char **argv)
 		ikcp_nodelay(g_ikcp, 1, 10, 2, 1);
 
 		g_loop = LOOP_RUNNING;
-		g_send_status = SEND_STATUS;
+		g_send_status = STOP_STATUS;
 
 		if (pthread_create(&tid, NULL, socket_slave_loop, NULL)) {
 			perror("Create thread failed");
