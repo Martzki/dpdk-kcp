@@ -315,6 +315,19 @@ void ikcp_release(ikcpcb *kcp)
 {
 	assert(kcp);
 	if (kcp) {
+		ikcp_reset(kcp);
+		ikcp_free(kcp);
+	}
+}
+
+
+//---------------------------------------------------------------------
+// reset a kcpcb
+//---------------------------------------------------------------------
+void ikcp_reset(ikcpcb *kcp)
+{
+	assert(kcp);
+	if (kcp) {
 		IKCPSEG *seg;
 		while (!iqueue_is_empty(&kcp->snd_buf)) {
 			seg = iqueue_entry(kcp->snd_buf.next, IKCPSEG, node);
@@ -350,7 +363,6 @@ void ikcp_release(ikcpcb *kcp)
 		kcp->ackcount = 0;
 		kcp->buffer = NULL;
 		kcp->acklist = NULL;
-		ikcp_free(kcp);
 	}
 }
 

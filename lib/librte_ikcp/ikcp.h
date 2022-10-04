@@ -351,6 +351,9 @@ int ikcp_init(ikcpcb *kcp, IUINT32 conv, void *user);
 // release kcp control object
 void ikcp_release(ikcpcb *kcp);
 
+// reset members of a specified kcp control object
+void ikcp_reset(ikcpcb *kcp);
+
 // set output callback, which will be invoked by kcp
 void ikcp_setoutput(ikcpcb *kcp, int (*output)(const char *buf, int len, 
 	ikcpcb *kcp, void *user));

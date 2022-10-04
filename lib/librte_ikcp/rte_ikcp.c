@@ -9,8 +9,8 @@
 #define IKCP_INPUT_BURST_SIZE 32U
 
 #define IKCP_MQ_NAME_SZIE 64
-#define IKCP_TX_QUEUE_NAME_FMT "IKCP_TX_%u"
-#define IKCP_RX_QUEUE_NAME_FMT "IKCP_RX_%u"
+#define IKCP_TX_QUEUE_NAME_FMT "IKCP_TX_%u_%u"
+#define IKCP_RX_QUEUE_NAME_FMT "IKCP_RX_%u_%u"
 #define IKCP_TX_QUEUE_SIZE 4096
 #define IKCP_RX_QUEUE_SIZE 4096
 
@@ -147,7 +147,7 @@ static inline int32_t ikcp_output(const char *buf, int32_t len, ikcpcb *kcp, voi
 	RTE_SET_USED(user);
 
 	if (ikcp->config.flags & RTE_IKCP_MQ) {
-		nb_tx = (int32_t)rte_ring_sp_enqueue(ikcp->tx_queue, head) == 0 ? 1 : 0;
+		nb_tx = (int32_t)rte_ring_sp_enqueue(ikcp->tx_queue, head) ? 0 : 1;
 	}
 	else {
 		nb_tx = (int32_t)rte_eth_tx_burst(port_id, txq_id, &head, 1);
@@ -171,13 +171,24 @@ static inline struct rte_ikcp * find_next_valid_ikcp(uint16_t port_id, uint32_t 
 	return NULL;
 }
 
+static inline int ikcp_release_cb(uint16_t port_id __rte_unused,
+				enum rte_eth_event_type event,
+				void *cb_arg, void *out __rte_unused)
+{
+	if (event != RTE_ETH_EVENT_DESTROY)
+		return 0;
+
+	rte_ikcp_release(cb_arg);
+
+	return 0;
+}
+
 struct rte_ikcp * rte_ikcp_create(struct rte_ikcp_config config, uint32_t conv, void *user)
 {
 	struct rte_eth_dev *dev;
 	struct rte_ikcp *ikcp;
 	char queue_name[IKCP_MQ_NAME_SZIE];
-	uint16_t port_id;
-	uint16_t txq_id;
+	uint16_t port_id, txq_id, mtu;
 
 	port_id = config.port_id;
 	txq_id = config.txq_id;
@@ -220,17 +231,17 @@ struct rte_ikcp * rte_ikcp_create(struct rte_ikcp_config config, uint32_t conv, 
 	}
 
 	if (ikcp->config.flags & RTE_IKCP_MQ) {
-		snprintf(queue_name, IKCP_MQ_NAME_SZIE, IKCP_RX_QUEUE_NAME_FMT, conv);
+		snprintf(queue_name, IKCP_MQ_NAME_SZIE, IKCP_RX_QUEUE_NAME_FMT, port_id, conv);
 		ikcp->rx_queue = rte_ring_create(queue_name, IKCP_RX_QUEUE_SIZE, SOCKET_ID_ANY, RING_F_SC_DEQ);
 		if (!ikcp->rx_queue) {
-			RTE_LOG(ERR, IKCP, "Create rx queue for conv: %u failed\n", conv);
+			RTE_LOG(ERR, IKCP, "Create rx queue for port: %u conv: %u failed.\n", port_id, conv);
 			return NULL;
 		}
 
-		snprintf(queue_name, IKCP_MQ_NAME_SZIE, IKCP_TX_QUEUE_NAME_FMT, conv);
+		snprintf(queue_name, IKCP_MQ_NAME_SZIE, IKCP_TX_QUEUE_NAME_FMT, port_id, conv);
 		ikcp->tx_queue = rte_ring_create(queue_name, IKCP_TX_QUEUE_SIZE, SOCKET_ID_ANY, RING_F_SP_ENQ);
 		if (!ikcp->tx_queue) {
-			RTE_LOG(ERR, IKCP, "Create tx queue for conv: %u failed\n", conv);
+			RTE_LOG(ERR, IKCP, "Create tx queue for port: %u conv: %u failed.\n", port_id, conv);
 			return NULL;
 		}
 	}
@@ -238,19 +249,42 @@ struct rte_ikcp * rte_ikcp_create(struct rte_ikcp_config config, uint32_t conv, 
 	ikcp_setoutput(&ikcp->kcp, ikcp_output);
 	ikcp_nodelay(&ikcp->kcp, 1, 10, 2, 1);
 
-	/* TODO: Set mss smaller than MTU. */
-	/* TODO: Register device destory callback. */
+	RTE_SET_USED(rte_eth_dev_get_mtu(port_id, &mtu));
+	RTE_SET_USED(ikcp_setmtu(&ikcp->kcp, mtu));
+
+	if (rte_eth_dev_callback_register(port_id, RTE_ETH_EVENT_DESTROY, ikcp_release_cb, &ikcp)) {
+		RTE_LOG(ERR, IKCP, "Register callback for port: %u conv: %u failed.\n", port_id, conv);
+		return NULL;
+	}
 
 	ikcp->config.flags |= RTE_IKCP_USED;
 
 	return ikcp;
 }
 
-int32_t rte_ikcp_update(struct rte_ikcp *ikcp)
+void rte_ikcp_release(struct rte_ikcp *ikcp)
 {
-	ikcp_update(&ikcp->kcp, rte_rdtsc() / rte_get_tsc_hz() * 100);
+	if (!(ikcp->config.flags))
+		return;
 
-	return 0;
+	ikcp->config.flags = 0;
+	rte_ring_free(ikcp->tx_queue);
+	rte_ring_free(ikcp->rx_queue);
+	ikcp_reset(&ikcp->kcp);
+	rte_eth_dev_callback_unregister(ikcp->config.port_id, RTE_ETH_EVENT_DESTROY, ikcp_release_cb, ikcp);
+}
+
+uint64_t rte_ikcp_check(struct rte_ikcp *ikcp)
+{
+	uint32_t current;
+
+	current = (uint32_t)((double)rte_rdtsc() / rte_get_tsc_hz() * 1000);
+	return (uint64_t)(ikcp_check(&ikcp->kcp, current) / 1000 * rte_get_tsc_hz());
+}
+
+void rte_ikcp_update(struct rte_ikcp *ikcp)
+{
+	ikcp_update(&ikcp->kcp, (uint32_t)((double)rte_rdtsc() / rte_get_tsc_hz() * 1000));
 }
 
 int32_t rte_ikcp_send(struct rte_ikcp *ikcp, const char* data, int32_t len)
@@ -313,7 +347,7 @@ int32_t rte_ikcp_input(struct rte_ikcp *ikcp, struct rte_mbuf *mbuf)
 		}
 	}
 
-	RTE_LOG(DEBUG, IKCP, "ikcp input: %s(%u).\n", data, len);
+	// RTE_LOG(DEBUG, IKCP, "ikcp input: %s(%u).\n", data, len);
 
 	ikcp_input(&ikcp->kcp, data, len);
 
@@ -346,4 +380,35 @@ int32_t rte_ikcp_input_bulk(struct rte_ikcp *ikcp) {
 	}
 
 	return 0;
+}
+
+void rte_ikcp_flush(struct rte_ikcp *ikcp)
+{
+	ikcp_flush(&ikcp->kcp);
+}
+
+void rte_ikcp_nodelay(struct rte_ikcp *ikcp, int32_t nodelay,
+					  int32_t interval, int32_t resend, int32_t nc)
+{
+	RTE_SET_USED(ikcp_nodelay(&ikcp->kcp, nodelay, interval, resend, nc));
+}
+
+int32_t rte_ikcp_peeksize(struct rte_ikcp *ikcp)
+{
+	return ikcp_peeksize(&ikcp->kcp);
+}
+
+int32_t rte_ikcp_setmtu(struct rte_ikcp *ikcp, int32_t mtu)
+{
+	return ikcp_setmtu(&ikcp->kcp, mtu);
+}
+
+int32_t rte_ikcp_wndsize(struct rte_ikcp *ikcp, int32_t sndwnd, int32_t rcvwnd)
+{
+	return ikcp_wndsize(&ikcp->kcp, sndwnd, rcvwnd);
+}
+
+int32_t rte_ikcp_waitsnd(struct rte_ikcp *ikcp)
+{
+	return ikcp_waitsnd(&ikcp->kcp);
 }
