@@ -100,7 +100,7 @@ void rte_ikcp_update(struct rte_ikcp *ikcp);
 /**
  * Send data to a kcp.
  *
- * It will allocate a mbuf and enqueue to internal kcp tx queue.
+ * Send data to internal kcp tx queue.
  * The data will be sent by rte_ikcp_flush or rte_ikcp_update on most occations.
  *
  * @param ikcp
@@ -133,7 +133,7 @@ int32_t rte_ikcp_recv(struct rte_ikcp *ikcp, char* data, int32_t len);
 /**
  * Enqueue the data of the mbuf to the kcp internal rx queue.
  *
- * The mbuf is checked whether belongs to the kcp or not and freed
+ * The mbuf is checked whether belongs to the rte_ikcp or not and freed
  * after enqueue sucessfully.
  *
  * @param ikcp
@@ -162,7 +162,7 @@ int32_t rte_ikcp_input(struct rte_ikcp *ikcp, struct rte_mbuf *mbuf);
 int32_t rte_ikcp_input_bulk(struct rte_ikcp *ikcp);
 
 /**
- * Flush pending data of a kcp.
+ * Flush pending data of kcp.
  *
  * It will be invoked in rte_ikcp_update and should not be invoked directly on
  * most occations.
